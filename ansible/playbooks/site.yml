@@ -1,0 +1,116 @@
+---
+- name: Configure this Proxmox VE host locally
+  hosts: local
+  gather_facts: true
+  become: true
+
+  vars:
+    debian_template_vmid: 9000
+    debian_template_name: debian-13-template
+    debian_template_storage: local-lvm
+    debian_cloud_image_url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+    debian_cloud_image_path: /var/lib/vz/template/iso/debian-13-genericcloud-amd64.qcow2
+
+  tasks:
+    - name: Install base administration and Proxmox packages
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - git
+          - openssh-client
+          - python3
+          - qemu-server
+          - sudo
+        state: present
+        update_cache: true
+
+    - name: Check whether the Debian template already exists
+      ansible.builtin.command:
+        argv:
+          - qm
+          - status
+          - "{{ debian_template_vmid }}"
+      register: debian_template_status
+      changed_when: false
+      failed_when: false
+
+    - name: Create Debian template directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - /var/lib/vz/template
+        - /var/lib/vz/template/iso
+      when: debian_template_status.rc != 0
+
+    - name: Download the Debian 13 generic cloud image
+      ansible.builtin.get_url:
+        url: "{{ debian_cloud_image_url }}"
+        dest: "{{ debian_cloud_image_path }}"
+        mode: "0644"
+      when: debian_template_status.rc != 0
+
+    - name: Create the Debian 13 template VM
+      ansible.builtin.command:
+        argv:
+          - qm
+          - create
+          - "{{ debian_template_vmid }}"
+          - --name
+          - "{{ debian_template_name }}"
+          - --memory
+          - "2048"
+          - --cores
+          - "2"
+          - --net0
+          - virtio,bridge=vmbr0
+          - --scsihw
+          - virtio-scsi-pci
+      when: debian_template_status.rc != 0
+
+    - name: Import the Debian cloud image as the template disk
+      ansible.builtin.command:
+        argv:
+          - qm
+          - importdisk
+          - "{{ debian_template_vmid }}"
+          - "{{ debian_cloud_image_path }}"
+          - "{{ debian_template_storage }}"
+      register: debian_disk_import
+      changed_when: debian_disk_import.rc == 0
+      when: debian_template_status.rc != 0
+
+    - name: Configure the template disk and cloud-init settings
+      ansible.builtin.command:
+        argv:
+          - qm
+          - set
+          - "{{ debian_template_vmid }}"
+          - --scsi0
+          - "{{ debian_template_storage }}:vm-{{ debian_template_vmid }}-disk-0"
+          - --ide2
+          - "{{ debian_template_storage }}:cloudinit"
+          - --boot
+          - order=scsi0
+          - --serial0
+          - socket
+          - --vga
+          - serial0
+          - --agent
+          - enabled=1
+          - --ipconfig0
+          - ip=dhcp
+      when: debian_template_status.rc != 0
+
+    - name: Convert the Debian VM into a template
+      ansible.builtin.command:
+        argv:
+          - qm
+          - template
+          - "{{ debian_template_vmid }}"
+      when: debian_template_status.rc != 0
+
+    - name: Report local setup
+      ansible.builtin.debug:
+        msg: "Proxmox is ready and template {{ debian_template_name }} (VM ID {{ debian_template_vmid }}) is available"
