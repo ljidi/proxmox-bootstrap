@@ -1,0 +1,473 @@
+---
+- name: "03 - Create a Debian automation VM for Forgejo Actions"
+  hosts: local
+  gather_facts: false
+  become: true
+
+  vars:
+    debian_template_vmid: 9000
+    automation_vm_vmid: 101
+    automation_vm_name: debian-automation
+    automation_vm_storage: local-lvm
+    automation_vm_memory: 8192
+    automation_vm_cores: 4
+    automation_vm_disk_resize: 40G
+    automation_vm_bridge: vmbr0
+    automation_vm_user: debian
+    automation_vm_ssh_key_path: /root/.ssh/proxmox-vm
+    automation_vm_ssh_public_key_path: "{{ automation_vm_ssh_key_path }}.pub"
+    automation_vm_ssh_private_key_path: "{{ automation_vm_ssh_key_path }}"
+    automation_runner_image: data.forgejo.org/forgejo/runner:13.0.0
+    automation_ansible_image: localhost/forgejo-ansible:13
+
+  tasks:
+    - name: Validate the automation VM ID
+      ansible.builtin.assert:
+        that:
+          - automation_vm_vmid | int != debian_template_vmid | int
+        fail_msg: >-
+          The automation VM ID must differ from the Debian template VM ID.
+
+    - name: Check that the VM SSH public key exists on the Proxmox host
+      ansible.builtin.stat:
+        path: "{{ automation_vm_ssh_public_key_path }}"
+      register: automation_vm_public_key
+
+    - name: Check that the VM SSH private key exists on the Ansible controller
+      ansible.builtin.stat:
+        path: "{{ automation_vm_ssh_private_key_path }}"
+      delegate_to: localhost
+      become: false
+      register: automation_vm_private_key
+
+    - name: Require readable VM SSH keys
+      ansible.builtin.assert:
+        that:
+          - automation_vm_public_key.stat.exists
+          - automation_vm_public_key.stat.isreg
+          - automation_vm_private_key.stat.exists
+          - automation_vm_private_key.stat.isreg
+        fail_msg: Run playbooks/01-site.yml first to create the Proxmox VM SSH keypair.
+
+    - name: Check that the Debian template exists
+      ansible.builtin.command:
+        argv:
+          - qm
+          - config
+          - "{{ debian_template_vmid }}"
+      register: automation_template_config
+      changed_when: false
+
+    - name: Require the source VM to be a template
+      ansible.builtin.assert:
+        that:
+          - automation_template_config.stdout is regex('(?m)^template: 1$')
+        fail_msg: Run playbooks/01-site.yml first to create the Debian template.
+
+    - name: Check whether the automation VM ID is already in use
+      ansible.builtin.command:
+        argv:
+          - qm
+          - status
+          - "{{ automation_vm_vmid }}"
+      register: automation_vm_status
+      changed_when: false
+      failed_when: false
+
+    - name: Refuse to overwrite an existing automation VM
+      ansible.builtin.assert:
+        that:
+          - automation_vm_status.rc != 0
+        fail_msg: >-
+          VM ID {{ automation_vm_vmid }} already exists. Choose a different
+          automation_vm_vmid; this playbook does not modify existing VMs.
+
+    - name: Clone the Debian template for the automation VM
+      ansible.builtin.command:
+        argv:
+          - qm
+          - clone
+          - "{{ debian_template_vmid }}"
+          - "{{ automation_vm_vmid }}"
+          - --name
+          - "{{ automation_vm_name }}"
+          - --full
+          - "1"
+          - --storage
+          - "{{ automation_vm_storage }}"
+
+    - name: Expand the automation VM disk
+      ansible.builtin.command:
+        argv:
+          - qm
+          - resize
+          - "{{ automation_vm_vmid }}"
+          - scsi0
+          - "+{{ automation_vm_disk_resize }}"
+
+    - name: Configure cloud-init access and networking
+      ansible.builtin.command:
+        argv:
+          - qm
+          - set
+          - "{{ automation_vm_vmid }}"
+          - --memory
+          - "{{ automation_vm_memory }}"
+          - --cores
+          - "{{ automation_vm_cores }}"
+          - --net0
+          - "virtio,bridge={{ automation_vm_bridge }}"
+          - --ciuser
+          - "{{ automation_vm_user }}"
+          - --sshkey
+          - "{{ automation_vm_ssh_public_key_path }}"
+          - --ipconfig0
+          - ip=dhcp
+          - --agent
+          - enabled=1
+
+    - name: Start the automation VM
+      ansible.builtin.command:
+        argv:
+          - qm
+          - start
+          - "{{ automation_vm_vmid }}"
+
+    - name: Wait for the automation VM guest agent to report its DHCP address
+      ansible.builtin.command:
+        argv:
+          - qm
+          - guest
+          - cmd
+          - "{{ automation_vm_vmid }}"
+          - network-get-interfaces
+      register: automation_guest_network
+      changed_when: false
+      failed_when: false
+      retries: 60
+      delay: 10
+      until: >-
+        automation_guest_network.rc == 0 and
+        (
+          automation_guest_network.stdout | from_json
+          | map(attribute='ip-addresses') | flatten
+          | selectattr('ip-address-type', 'equalto', 'ipv4')
+          | rejectattr('ip-address', 'match', '^(127\.|169\.254\.)')
+          | list | length > 0
+        )
+
+    - name: Set the automation VM DHCP IPv4 address
+      ansible.builtin.set_fact:
+        automation_vm_ipv4: >-
+          {{
+            automation_guest_network.stdout | from_json
+            | map(attribute='ip-addresses') | flatten
+            | selectattr('ip-address-type', 'equalto', 'ipv4')
+            | rejectattr('ip-address', 'match', '^(127\.|169\.254\.)')
+            | map(attribute='ip-address') | list | first
+          }}
+
+    - name: Add the automation VM to the in-memory inventory
+      ansible.builtin.add_host:
+        name: forgejo_automation_vm
+        groups: forgejo_automation
+        ansible_host: "{{ automation_vm_ipv4 }}"
+        ansible_user: "{{ automation_vm_user }}"
+        ansible_ssh_private_key_file: "{{ automation_vm_ssh_private_key_path }}"
+        ansible_python_interpreter: /usr/bin/python3
+        automation_vm_ipv4: "{{ automation_vm_ipv4 }}"
+
+- name: Configure the automation VM and Forgejo runner
+  hosts: forgejo_automation
+  gather_facts: false
+  become: true
+
+  vars:
+    automation_runner_image: data.forgejo.org/forgejo/runner:13.0.0
+    automation_ansible_image: localhost/forgejo-ansible:13
+    automation_runner_dir: /home/debian/forgejo-runner
+    automation_runner_config_dir: /home/debian/.config/forgejo-runner
+    automation_quadlet_dir: /home/debian/.config/containers/systemd
+    automation_ansible_image_dir: /home/debian/forgejo-runner/ansible-image
+    automation_ansible_ssh_key_path: /home/debian/.ssh/ansible_ed25519
+
+  tasks:
+    - name: Wait for the automation VM to accept SSH connections
+      ansible.builtin.wait_for_connection:
+        delay: 10
+        timeout: 600
+
+    - name: Gather automation VM facts
+      ansible.builtin.setup:
+
+    - name: Require a Debian automation VM
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == "Debian"
+        fail_msg: The cloned automation guest did not report itself as Debian.
+
+    - name: Install Ansible, Podman, and rootless container dependencies
+      ansible.builtin.apt:
+        name:
+          - ansible
+          - ca-certificates
+          - dbus-user-session
+          - fuse-overlayfs
+          - git
+          - openssh-client
+          - podman
+          - slirp4netns
+          - uidmap
+        state: present
+        update_cache: true
+
+    - name: Read the automation user's linger state
+      ansible.builtin.command:
+        argv:
+          - loginctl
+          - show-user
+          - debian
+          - --property=Linger
+          - --value
+      register: automation_linger_status
+      changed_when: false
+
+    - name: Enable lingering for the automation user
+      ansible.builtin.command:
+        argv:
+          - loginctl
+          - enable-linger
+          - debian
+      when: automation_linger_status.stdout != "yes"
+
+    - name: Get the automation user's numeric ID
+      ansible.builtin.command:
+        argv:
+          - id
+          - -u
+          - debian
+      register: automation_user_uid
+      changed_when: false
+
+    - name: Wait for the automation user's systemd runtime directory
+      ansible.builtin.wait_for:
+        path: "/run/user/{{ automation_user_uid.stdout }}"
+        state: present
+        timeout: 60
+
+    - name: Wait for the automation user's systemd bus
+      ansible.builtin.wait_for:
+        path: "/run/user/{{ automation_user_uid.stdout }}/bus"
+        state: present
+        timeout: 60
+
+    - name: Create the automation user's SSH directory
+      ansible.builtin.file:
+        path: /home/debian/.ssh
+        state: directory
+        owner: debian
+        group: debian
+        mode: "0700"
+
+    - name: Generate the Ansible deployment SSH keypair when absent
+      ansible.builtin.command:
+        argv:
+          - ssh-keygen
+          - -q
+          - -t
+          - ed25519
+          - -N
+          - ""
+          - -C
+          - forgejo-ansible-automation
+          - -f
+          - "{{ automation_ansible_ssh_key_path }}"
+        creates: "{{ automation_ansible_ssh_key_path }}"
+      become_user: debian
+
+    - name: Set secure permissions on the Ansible deployment private key
+      ansible.builtin.file:
+        path: "{{ automation_ansible_ssh_key_path }}"
+        state: file
+        owner: debian
+        group: debian
+        mode: "0600"
+
+    - name: Read the Ansible deployment public key
+      ansible.builtin.command:
+        argv:
+          - cat
+          - "{{ automation_ansible_ssh_key_path }}.pub"
+      register: automation_ansible_public_key
+      changed_when: false
+
+    - name: Create rootless runner and Quadlet directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: debian
+        group: debian
+        mode: "0750"
+      loop:
+        - "{{ automation_runner_dir }}"
+        - "{{ automation_runner_config_dir }}"
+        - "{{ automation_quadlet_dir }}"
+        - "{{ automation_ansible_image_dir }}"
+
+    - name: Configure the Ansible workflow job image
+      ansible.builtin.copy:
+        dest: "{{ automation_ansible_image_dir }}/Containerfile"
+        owner: debian
+        group: debian
+        mode: "0644"
+        content: |
+          FROM docker.io/library/debian:13
+          RUN apt-get update \
+              && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                  ansible ca-certificates git nodejs openssh-client python3 \
+              && rm -rf /var/lib/apt/lists/*
+      register: automation_ansible_containerfile
+
+    - name: Check whether the Ansible workflow job image exists
+      ansible.builtin.command:
+        argv:
+          - podman
+          - image
+          - exists
+          - "{{ automation_ansible_image }}"
+      register: automation_ansible_image_status
+      changed_when: false
+      failed_when: false
+      become_user: debian
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ automation_user_uid.stdout }}"
+
+    - name: Build the Ansible workflow job image
+      ansible.builtin.command:
+        argv:
+          - podman
+          - build
+          - --tag
+          - "{{ automation_ansible_image }}"
+          - "{{ automation_ansible_image_dir }}"
+      when: >-
+        automation_ansible_containerfile.changed or
+        automation_ansible_image_status.rc != 0
+      become_user: debian
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ automation_user_uid.stdout }}"
+
+    - name: Configure Forgejo Runner
+      ansible.builtin.copy:
+        dest: "{{ automation_runner_config_dir }}/config.yaml"
+        owner: debian
+        group: debian
+        mode: "0600"
+        content: |
+          log:
+            level: info
+          runner:
+            file: /data/.runner
+            capacity: 1
+            labels:
+              - ansible:docker://{{ automation_ansible_image }}
+          cache:
+            enabled: false
+          container:
+            network: ""
+            privileged: false
+            options: "--volume {{ automation_ansible_ssh_key_path }}:/run/secrets/ansible_ed25519:ro"
+            valid_volumes: []
+            docker_host: unix:///run/podman/podman.sock
+            force_pull: false
+            force_rebuild: false
+
+    - name: Configure the Forgejo Runner pod
+      ansible.builtin.copy:
+        dest: "{{ automation_quadlet_dir }}/forgejo-runner.pod"
+        owner: debian
+        group: debian
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Rootless Forgejo Actions runner pod
+
+          [Pod]
+          PodName=forgejo-runner
+
+          [Install]
+          WantedBy=default.target
+      register: automation_runner_pod
+
+    - name: Configure the Forgejo Runner container
+      ansible.builtin.copy:
+        dest: "{{ automation_quadlet_dir }}/forgejo-runner.container"
+        owner: debian
+        group: debian
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Forgejo Actions runner
+          Requires=podman.socket
+          After=podman.socket
+
+          [Container]
+          Image={{ automation_runner_image }}
+          ContainerName=forgejo-runner
+          Pod=forgejo-runner.pod
+          UserNS=keep-id
+          Volume={{ automation_runner_dir }}:/data
+          Volume={{ automation_runner_config_dir }}/config.yaml:/etc/forgejo-runner/config.yaml:ro
+          Volume=/run/user/{{ automation_user_uid.stdout }}/podman/podman.sock:/run/podman/podman.sock
+          WorkingDir=/data
+          Exec=forgejo-runner daemon --config /etc/forgejo-runner/config.yaml
+
+          [Service]
+          Restart=always
+
+          [Install]
+          WantedBy=default.target
+      register: automation_runner_container
+
+    - name: Start the rootless Podman API socket
+      ansible.builtin.systemd_service:
+        name: podman.socket
+        scope: user
+        enabled: true
+        state: started
+        daemon_reload: true
+      become_user: debian
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ automation_user_uid.stdout }}"
+        DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ automation_user_uid.stdout }}/bus"
+
+    - name: Check whether the Forgejo Runner image exists
+      ansible.builtin.command:
+        argv:
+          - podman
+          - image
+          - exists
+          - "{{ automation_runner_image }}"
+      register: automation_runner_image_status
+      changed_when: false
+      failed_when: false
+      become_user: debian
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ automation_user_uid.stdout }}"
+
+    - name: Pull the Forgejo Runner image
+      ansible.builtin.command:
+        argv:
+          - podman
+          - pull
+          - "{{ automation_runner_image }}"
+      when: automation_runner_image_status.rc != 0
+      become_user: debian
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ automation_user_uid.stdout }}"
+
+    - name: Display the Ansible deployment public key
+      ansible.builtin.debug:
+        msg:
+          - "Add this public key to authorized_keys on the hosts Ansible should manage:"
+          - "{{ automation_ansible_public_key.stdout }}"

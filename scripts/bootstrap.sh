@@ -83,7 +83,10 @@ log "Testing the repository Ansible setup"
 cd "$ANSIBLE_DIR"
 ansible local -m ping
 
+log "Running the complete Proxmox and VM setup"
+ansible-playbook playbooks/setup-all.yml
+
 log "Bootstrap complete"
 printf '\nRepository: %s\n' "$REPO_DIR"
 printf 'Ansible directory: %s\n' "$ANSIBLE_DIR"
-printf 'Run the local playbook with:\n  cd %q\n  ansible-playbook playbooks/site.yml\n' "$ANSIBLE_DIR"
+printf 'Provisioning playbook: %s\n' "$ANSIBLE_DIR/playbooks/setup-all.yml"

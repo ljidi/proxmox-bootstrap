@@ -1,0 +1,382 @@
+---
+- name: "02 - Create a Debian DevOps VM on this Proxmox host"
+  hosts: local
+  gather_facts: false
+  become: true
+
+  vars:
+    debian_template_vmid: 9000
+    debian_vm_vmid: 100
+    debian_vm_name: debian-devops
+    debian_vm_storage: local-lvm
+    debian_vm_memory: 4096
+    debian_vm_cores: 2
+    debian_vm_disk_resize: 20G
+    debian_vm_bridge: vmbr0
+    debian_vm_user: debian
+    debian_vm_ssh_key_path: /root/.ssh/proxmox-vm
+    debian_vm_ssh_public_key_path: "{{ debian_vm_ssh_key_path }}.pub"
+    debian_vm_ssh_private_key_path: "{{ debian_vm_ssh_key_path }}"
+
+  tasks:
+    - name: Validate the VM ID
+      ansible.builtin.assert:
+        that:
+          - debian_vm_vmid | int != debian_template_vmid | int
+        fail_msg: The new VM ID must differ from the Debian template VM ID.
+
+    - name: Check that the SSH public key exists on the Proxmox host
+      ansible.builtin.stat:
+        path: "{{ debian_vm_ssh_public_key_path }}"
+      register: debian_vm_public_key
+
+    - name: Check that the SSH private key exists on the Ansible controller
+      ansible.builtin.stat:
+        path: "{{ debian_vm_ssh_private_key_path }}"
+      delegate_to: localhost
+      become: false
+      register: debian_vm_private_key
+
+    - name: Require readable SSH key files
+      ansible.builtin.assert:
+        that:
+          - debian_vm_public_key.stat.exists
+          - debian_vm_public_key.stat.isreg
+          - debian_vm_private_key.stat.exists
+          - debian_vm_private_key.stat.isreg
+        fail_msg: The configured SSH key paths must point to existing files.
+
+    - name: Check that the Debian template exists
+      ansible.builtin.command:
+        argv:
+          - qm
+          - config
+          - "{{ debian_template_vmid }}"
+      register: debian_template_config
+      changed_when: false
+
+    - name: Require the source VM to be a template
+      ansible.builtin.assert:
+        that:
+          - debian_template_config.stdout is regex('(?m)^template: 1$')
+        fail_msg: >-
+          VM {{ debian_template_vmid }} is not a Proxmox template. Run
+          playbooks/01-site.yml first to create the Debian template.
+
+    - name: Check whether the requested VM ID is already in use
+      ansible.builtin.command:
+        argv:
+          - qm
+          - status
+          - "{{ debian_vm_vmid }}"
+      register: debian_vm_status
+      changed_when: false
+      failed_when: false
+
+    - name: Refuse to overwrite an existing VM
+      ansible.builtin.assert:
+        that:
+          - debian_vm_status.rc != 0
+        fail_msg: >-
+          VM ID {{ debian_vm_vmid }} already exists. Choose a different
+          debian_vm_vmid; this playbook does not modify existing VMs.
+
+    - name: Clone the Debian template
+      ansible.builtin.command:
+        argv:
+          - qm
+          - clone
+          - "{{ debian_template_vmid }}"
+          - "{{ debian_vm_vmid }}"
+          - --name
+          - "{{ debian_vm_name }}"
+          - --full
+          - "1"
+          - --storage
+          - "{{ debian_vm_storage }}"
+
+    - name: Expand the cloned VM disk
+      ansible.builtin.command:
+        argv:
+          - qm
+          - resize
+          - "{{ debian_vm_vmid }}"
+          - scsi0
+          - "+{{ debian_vm_disk_resize }}"
+
+    - name: Configure cloud-init access and networking
+      ansible.builtin.command:
+        argv:
+          - qm
+          - set
+          - "{{ debian_vm_vmid }}"
+          - --memory
+          - "{{ debian_vm_memory }}"
+          - --cores
+          - "{{ debian_vm_cores }}"
+          - --net0
+          - "virtio,bridge={{ debian_vm_bridge }}"
+          - --ciuser
+          - "{{ debian_vm_user }}"
+          - --sshkey
+          - "{{ debian_vm_ssh_public_key_path }}"
+          - --ipconfig0
+          - ip=dhcp
+          - --agent
+          - enabled=1
+
+    - name: Start the Debian VM
+      ansible.builtin.command:
+        argv:
+          - qm
+          - start
+          - "{{ debian_vm_vmid }}"
+
+    - name: Wait for the VM guest agent to report its DHCP address
+      ansible.builtin.command:
+        argv:
+          - qm
+          - guest
+          - cmd
+          - "{{ debian_vm_vmid }}"
+          - network-get-interfaces
+      register: debian_vm_guest_network
+      changed_when: false
+      failed_when: false
+      retries: 60
+      delay: 10
+      until: >-
+        debian_vm_guest_network.rc == 0 and
+        (
+          debian_vm_guest_network.stdout | from_json
+          | map(attribute='ip-addresses') | flatten
+          | selectattr('ip-address-type', 'equalto', 'ipv4')
+          | rejectattr('ip-address', 'match', '^(127\.|169\.254\.)')
+          | list | length > 0
+        )
+
+    - name: Set the VM DHCP IPv4 address
+      ansible.builtin.set_fact:
+        debian_vm_guest_ipv4: >-
+          {{
+            debian_vm_guest_network.stdout | from_json
+            | map(attribute='ip-addresses') | flatten
+            | selectattr('ip-address-type', 'equalto', 'ipv4')
+            | rejectattr('ip-address', 'match', '^(127\.|169\.254\.)')
+            | map(attribute='ip-address') | list | first
+          }}
+
+    - name: Add the new VM to the in-memory inventory
+      ansible.builtin.add_host:
+        name: debian_devops_vm
+        groups: devops_vm
+        ansible_host: "{{ debian_vm_guest_ipv4 }}"
+        ansible_user: "{{ debian_vm_user }}"
+        ansible_ssh_private_key_file: "{{ debian_vm_ssh_private_key_path }}"
+        ansible_python_interpreter: /usr/bin/python3
+        forgejo_vm_ipv4: "{{ debian_vm_guest_ipv4 }}"
+
+- name: Install Forgejo and PostgreSQL in a Podman pod
+  hosts: devops_vm
+  gather_facts: false
+  become: true
+
+  vars:
+    forgejo_image: codeberg.org/forgejo/forgejo:latest
+    forgejo_postgres_image: docker.io/library/postgres:17
+
+  tasks:
+    - name: Wait for the Debian VM to accept SSH connections
+      ansible.builtin.wait_for_connection:
+        delay: 10
+        timeout: 600
+
+    - name: Gather Debian VM facts
+      ansible.builtin.setup:
+
+    - name: Require a Debian guest
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == "Debian"
+        fail_msg: The cloned guest did not report itself as Debian.
+
+    - name: Install Podman and OpenSSL
+      ansible.builtin.apt:
+        name:
+          - openssl
+          - podman
+        state: present
+        update_cache: true
+
+    - name: Create Forgejo configuration directory
+      ansible.builtin.file:
+        path: /etc/forgejo
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Check whether the Forgejo database environment file exists
+      ansible.builtin.stat:
+        path: /etc/forgejo/forgejo.env
+      register: forgejo_environment_file
+
+    - name: Generate the Forgejo database password
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - rand
+          - -hex
+          - "32"
+      register: forgejo_database_password
+      changed_when: false
+      no_log: true
+      when: not forgejo_environment_file.stat.exists
+
+    - name: Store Forgejo and PostgreSQL environment settings
+      ansible.builtin.copy:
+        dest: /etc/forgejo/forgejo.env
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          POSTGRES_DB=forgejo
+          POSTGRES_USER=forgejo
+          POSTGRES_PASSWORD={{ forgejo_database_password.stdout }}
+          FORGEJO__database__DB_TYPE=postgres
+          FORGEJO__database__HOST=127.0.0.1:5432
+          FORGEJO__database__NAME=forgejo
+          FORGEJO__database__USER=forgejo
+          FORGEJO__database__PASSWD={{ forgejo_database_password.stdout }}
+      no_log: true
+      when: not forgejo_environment_file.stat.exists
+
+    - name: Create Podman Quadlet configuration directory
+      ansible.builtin.file:
+        path: /etc/containers/systemd
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Configure the Forgejo pod
+      ansible.builtin.copy:
+        dest: /etc/containers/systemd/forgejo.pod
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Forgejo and PostgreSQL pod
+
+          [Pod]
+          PodName=forgejo
+          PublishPort=3000:3000
+          PublishPort=2222:22
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Configure the PostgreSQL container
+      ansible.builtin.copy:
+        dest: /etc/containers/systemd/forgejo-postgres.container
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=PostgreSQL database for Forgejo
+
+          [Container]
+          ContainerName=forgejo-postgres
+          Image={{ forgejo_postgres_image }}
+          Pod=forgejo.pod
+          EnvironmentFile=/etc/forgejo/forgejo.env
+          Volume=forgejo-postgres-data:/var/lib/postgresql/data
+
+          [Service]
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Configure the Forgejo container
+      ansible.builtin.copy:
+        dest: /etc/containers/systemd/forgejo.container
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Forgejo Git service
+          Requires=forgejo-postgres.service
+          After=forgejo-postgres.service
+
+          [Container]
+          ContainerName=forgejo
+          Image={{ forgejo_image }}
+          Pod=forgejo.pod
+          EnvironmentFile=/etc/forgejo/forgejo.env
+          Environment=USER_UID=1000
+          Environment=USER_GID=1000
+          Environment=FORGEJO__server__DOMAIN={{ forgejo_vm_ipv4 }}
+          Environment=FORGEJO__server__ROOT_URL=http://{{ forgejo_vm_ipv4 }}:3000/
+          Environment=FORGEJO__server__SSH_DOMAIN={{ forgejo_vm_ipv4 }}
+          Environment=FORGEJO__server__SSH_PORT=2222
+          Environment=FORGEJO__server__START_SSH_SERVER=true
+          Environment=FORGEJO__security__INSTALL_LOCK=true
+          Volume=forgejo-data:/data
+
+          [Service]
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Start the PostgreSQL container
+      ansible.builtin.systemd_service:
+        name: forgejo-postgres.service
+        state: started
+        daemon_reload: true
+
+    - name: Wait for PostgreSQL to accept connections
+      ansible.builtin.command:
+        argv:
+          - podman
+          - exec
+          - forgejo-postgres
+          - pg_isready
+          - -U
+          - forgejo
+          - -d
+          - forgejo
+      register: forgejo_postgres_ready
+      changed_when: false
+      retries: 30
+      delay: 2
+      until: forgejo_postgres_ready.rc == 0
+
+    - name: Start the Forgejo container
+      ansible.builtin.systemd_service:
+        name: forgejo.service
+        state: started
+        daemon_reload: true
+
+    - name: Wait for Forgejo to be reachable from the Proxmox host
+      ansible.builtin.uri:
+        url: "http://{{ forgejo_vm_ipv4 }}:3000/"
+        method: GET
+        status_code: 200
+      register: forgejo_http_check
+      changed_when: false
+      retries: 60
+      delay: 5
+      until: forgejo_http_check.status | default(0) == 200
+      delegate_to: localhost
+      become: false
+
+    - name: Report the Forgejo service URL
+      ansible.builtin.debug:
+        msg: >-
+          Forgejo is running at http://{{ forgejo_vm_ipv4 }}:3000/
+          (SSH clone port 2222).

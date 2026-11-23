@@ -1,0 +1,584 @@
+---
+- name: "04 - Discover Forgejo and automation VMs on Proxmox"
+  hosts: local
+  gather_facts: false
+  become: true
+
+  vars:
+    forgejo_vm_vmid: 100
+    automation_vm_vmid: 101
+    forgejo_ssh_user: debian
+    automation_ssh_user: debian
+    proxmox_vm_ssh_key_path: /root/.ssh/proxmox-vm
+    forgejo_server_url: ""
+    forgejo_admin_username: proxmox-admin
+    forgejo_admin_email: proxmox-admin@example.invalid
+    forgejo_admin_credentials_path: /etc/forgejo/admin-credentials.json
+    forgejo_organization_name: environment
+    forgejo_repository_name: infrastructure
+    forgejo_runner_name: proxmox-automation
+    forgejo_runner_labels: ansible:docker://localhost/forgejo-ansible:13
+
+  tasks:
+    - name: Validate the VM IDs
+      ansible.builtin.assert:
+        that:
+          - forgejo_vm_vmid | int != automation_vm_vmid | int
+        fail_msg: Ensure the Forgejo and automation VM IDs differ.
+
+    - name: Check that the Proxmox VM SSH private key exists
+      ansible.builtin.stat:
+        path: "{{ proxmox_vm_ssh_key_path }}"
+      register: proxmox_vm_ssh_key
+
+    - name: Require the Proxmox VM SSH private key
+      ansible.builtin.assert:
+        that:
+          - proxmox_vm_ssh_key.stat.exists
+          - proxmox_vm_ssh_key.stat.isreg
+        fail_msg: Run playbooks/01-site.yml first to create the Proxmox VM SSH keypair.
+
+    - name: Check that the Forgejo VM is running
+      ansible.builtin.command:
+        argv:
+          - qm
+          - status
+          - "{{ forgejo_vm_vmid }}"
+      register: forgejo_vm_status
+      changed_when: false
+      failed_when: false
+
+    - name: Check that the automation VM is running
+      ansible.builtin.command:
+        argv:
+          - qm
+          - status
+          - "{{ automation_vm_vmid }}"
+      register: automation_vm_status
+      changed_when: false
+      failed_when: false
+
+    - name: Require both VMs to be running
+      ansible.builtin.assert:
+        that:
+          - forgejo_vm_status.rc == 0
+          - "'status: running' in forgejo_vm_status.stdout"
+          - automation_vm_status.rc == 0
+          - "'status: running' in automation_vm_status.stdout"
+        fail_msg: >-
+          Start the Forgejo and automation VMs before configuring runner
+          registration.
+
+    - name: Wait for the Forgejo VM guest agent to report its DHCP address
+      ansible.builtin.command:
+        argv:
+          - qm
+          - guest
+          - cmd
+          - "{{ forgejo_vm_vmid }}"
+          - network-get-interfaces
+      register: forgejo_guest_network
+      changed_when: false
+      failed_when: false
+      retries: 60
+      delay: 10
+      until: >-
+        forgejo_guest_network.rc == 0 and
+        (
+          forgejo_guest_network.stdout | from_json
+          | map(attribute='ip-addresses') | flatten
+          | selectattr('ip-address-type', 'equalto', 'ipv4')
+          | rejectattr('ip-address', 'match', '^(127\.|169\.254\.)')
+          | list | length > 0
+        )
+
+    - name: Set the Forgejo VM DHCP IPv4 address
+      ansible.builtin.set_fact:
+        forgejo_vm_ipv4: >-
+          {{
+            forgejo_guest_network.stdout | from_json
+            | map(attribute='ip-addresses') | flatten
+            | selectattr('ip-address-type', 'equalto', 'ipv4')
+            | rejectattr('ip-address', 'match', '^(127\.|169\.254\.)')
+            | map(attribute='ip-address') | list | first
+          }}
+
+    - name: Wait for the automation VM guest agent to report its DHCP address
+      ansible.builtin.command:
+        argv:
+          - qm
+          - guest
+          - cmd
+          - "{{ automation_vm_vmid }}"
+          - network-get-interfaces
+      register: automation_guest_network
+      changed_when: false
+      failed_when: false
+      retries: 60
+      delay: 10
+      until: >-
+        automation_guest_network.rc == 0 and
+        (
+          automation_guest_network.stdout | from_json
+          | map(attribute='ip-addresses') | flatten
+          | selectattr('ip-address-type', 'equalto', 'ipv4')
+          | rejectattr('ip-address', 'match', '^(127\.|169\.254\.)')
+          | list | length > 0
+        )
+
+    - name: Set the automation VM DHCP IPv4 address
+      ansible.builtin.set_fact:
+        automation_vm_ipv4: >-
+          {{
+            automation_guest_network.stdout | from_json
+            | map(attribute='ip-addresses') | flatten
+            | selectattr('ip-address-type', 'equalto', 'ipv4')
+            | rejectattr('ip-address', 'match', '^(127\.|169\.254\.)')
+            | map(attribute='ip-address') | list | first
+          }}
+
+    - name: Add the Forgejo VM to the in-memory inventory
+      ansible.builtin.add_host:
+        name: forgejo_server_vm
+        groups: forgejo_server
+        ansible_host: "{{ forgejo_vm_ipv4 }}"
+        ansible_user: "{{ forgejo_ssh_user }}"
+        ansible_ssh_private_key_file: "{{ proxmox_vm_ssh_key_path }}"
+        ansible_python_interpreter: /usr/bin/python3
+        forgejo_admin_username: "{{ forgejo_admin_username }}"
+        forgejo_admin_email: "{{ forgejo_admin_email }}"
+        forgejo_admin_credentials_path: "{{ forgejo_admin_credentials_path }}"
+        forgejo_organization_name: "{{ forgejo_organization_name }}"
+        forgejo_repository_name: "{{ forgejo_repository_name }}"
+        forgejo_runner_scope: "{{ forgejo_organization_name }}"
+        forgejo_runner_name: "{{ forgejo_runner_name }}"
+        forgejo_runner_labels: "{{ forgejo_runner_labels }}"
+        forgejo_server_url: >-
+          {{
+            forgejo_server_url
+            | default('http://' ~ forgejo_vm_ipv4 ~ ':3000/', true)
+          }}
+      no_log: true
+
+    - name: Add the automation VM to the in-memory inventory
+      ansible.builtin.add_host:
+        name: forgejo_automation_vm
+        groups: forgejo_automation
+        ansible_host: "{{ automation_vm_ipv4 }}"
+        ansible_user: "{{ automation_ssh_user }}"
+        ansible_ssh_private_key_file: "{{ proxmox_vm_ssh_key_path }}"
+        ansible_python_interpreter: /usr/bin/python3
+        forgejo_server_url: >-
+          {{
+            forgejo_server_url
+            | default('http://' ~ forgejo_vm_ipv4 ~ ':3000/', true)
+          }}
+        forgejo_runner_name: "{{ forgejo_runner_name }}"
+        forgejo_runner_labels: "{{ forgejo_runner_labels }}"
+
+- name: Create the Forgejo organization and repository
+  hosts: forgejo_server
+  gather_facts: false
+  become: true
+
+  vars:
+    forgejo_local_api_url: http://127.0.0.1:3000/api/v1
+
+  tasks:
+    - name: Wait for Forgejo to accept HTTP connections
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 3000
+        timeout: 600
+
+    - name: Check whether the Forgejo administrator credentials exist
+      ansible.builtin.stat:
+        path: "{{ forgejo_admin_credentials_path }}"
+      register: forgejo_admin_credentials_file
+
+    - name: Require existing administrator credentials to be a regular file
+      ansible.builtin.assert:
+        that:
+          - forgejo_admin_credentials_file.stat.isreg
+        fail_msg: The Forgejo administrator credentials path must be a regular file.
+      when: forgejo_admin_credentials_file.stat.exists
+
+    - name: Secure the existing administrator credentials file
+      ansible.builtin.file:
+        path: "{{ forgejo_admin_credentials_path }}"
+        owner: root
+        group: root
+        mode: "0600"
+      when: forgejo_admin_credentials_file.stat.exists
+
+    - name: Read the existing Forgejo administrator credentials
+      ansible.builtin.slurp:
+        src: "{{ forgejo_admin_credentials_path }}"
+      register: forgejo_admin_credentials_data
+      no_log: true
+      when: forgejo_admin_credentials_file.stat.exists
+
+    - name: Load the existing Forgejo administrator credentials
+      ansible.builtin.set_fact:
+        forgejo_admin_credentials: "{{ forgejo_admin_credentials_data.content | b64decode | from_json }}"
+      no_log: true
+      when: forgejo_admin_credentials_file.stat.exists
+
+    - name: Require the saved administrator username to match configuration
+      ansible.builtin.assert:
+        that:
+          - forgejo_admin_credentials.username == forgejo_admin_username
+        fail_msg: >-
+          The saved Forgejo administrator username differs from
+          forgejo_admin_username. Keep the configured username or update the
+          credentials file and Forgejo account together.
+      when: forgejo_admin_credentials_file.stat.exists
+
+    - name: Generate a strong Forgejo administrator password
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - import secrets; print(secrets.token_hex(32))
+      register: forgejo_generated_admin_password
+      changed_when: false
+      no_log: true
+      when: not forgejo_admin_credentials_file.stat.exists
+
+    - name: Create the Forgejo administrator user
+      ansible.builtin.command:
+        argv:
+          - podman
+          - exec
+          - --user
+          - git
+          - forgejo
+          - forgejo
+          - admin
+          - user
+          - create
+          - --username
+          - "{{ forgejo_admin_username }}"
+          - --password
+          - "{{ forgejo_generated_admin_password.stdout | trim }}"
+          - --email
+          - "{{ forgejo_admin_email }}"
+          - --admin
+          - --must-change-password=false
+      register: forgejo_admin_creation
+      changed_when: true
+      no_log: true
+      when: not forgejo_admin_credentials_file.stat.exists
+
+    - name: Store the Forgejo administrator credentials for root only
+      ansible.builtin.copy:
+        dest: "{{ forgejo_admin_credentials_path }}"
+        content: >-
+          {{
+            {
+              'username': forgejo_admin_username,
+              'password': forgejo_generated_admin_password.stdout | trim
+            } | to_nice_json
+          }}
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      when: not forgejo_admin_credentials_file.stat.exists
+
+    - name: Set the Forgejo API credentials from the new account
+      ansible.builtin.set_fact:
+        forgejo_api_username: "{{ forgejo_admin_username }}"
+        forgejo_api_password: "{{ forgejo_generated_admin_password.stdout | trim }}"
+      no_log: true
+      when: not forgejo_admin_credentials_file.stat.exists
+
+    - name: Set the Forgejo API credentials from the saved account
+      ansible.builtin.set_fact:
+        forgejo_api_username: "{{ forgejo_admin_credentials.username }}"
+        forgejo_api_password: "{{ forgejo_admin_credentials.password }}"
+      no_log: true
+      when: forgejo_admin_credentials_file.stat.exists
+
+    - name: Verify the generated Forgejo administrator credentials
+      ansible.builtin.uri:
+        url: "{{ forgejo_local_api_url }}/user"
+        method: GET
+        url_username: "{{ forgejo_api_username }}"
+        url_password: "{{ forgejo_api_password }}"
+        force_basic_auth: true
+        status_code:
+          - 200
+          - 401
+      register: forgejo_api_identity
+      changed_when: false
+      no_log: true
+
+    - name: Require the API credentials to identify the created administrator
+      ansible.builtin.assert:
+        that:
+          - forgejo_api_identity.status == 200
+          - forgejo_api_identity.json.login == forgejo_admin_username
+          - forgejo_api_identity.json.is_admin
+        fail_msg: The Forgejo API credentials do not identify the configured administrator.
+
+    - name: Make administrator credentials available for the final report
+      ansible.builtin.add_host:
+        name: forgejo_automation_vm
+        groups: forgejo_automation
+        forgejo_admin_username: "{{ forgejo_api_username }}"
+        forgejo_admin_password: "{{ forgejo_api_password }}"
+      no_log: true
+
+    - name: Check whether the Forgejo organization exists
+      ansible.builtin.uri:
+        url: "{{ forgejo_local_api_url }}/orgs/{{ forgejo_organization_name }}"
+        method: GET
+        url_username: "{{ forgejo_api_username }}"
+        url_password: "{{ forgejo_api_password }}"
+        force_basic_auth: true
+        status_code:
+          - 200
+          - 404
+      register: forgejo_organization
+      changed_when: false
+      no_log: true
+
+    - name: Create the Forgejo organization when absent
+      ansible.builtin.uri:
+        url: "{{ forgejo_local_api_url }}/orgs"
+        method: POST
+        url_username: "{{ forgejo_api_username }}"
+        url_password: "{{ forgejo_api_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          username: "{{ forgejo_organization_name }}"
+          full_name: "{{ forgejo_organization_name }}"
+        status_code: 201
+      when: forgejo_organization.status == 404
+      no_log: true
+
+    - name: Check whether the Forgejo repository exists
+      ansible.builtin.uri:
+        url: >-
+          {{ forgejo_local_api_url }}/repos/{{ forgejo_organization_name }}/{{ forgejo_repository_name }}
+        method: GET
+        url_username: "{{ forgejo_api_username }}"
+        url_password: "{{ forgejo_api_password }}"
+        force_basic_auth: true
+        status_code:
+          - 200
+          - 404
+      register: forgejo_repository
+      changed_when: false
+      no_log: true
+
+    - name: Create the private Forgejo repository when absent
+      ansible.builtin.uri:
+        url: >-
+          {{ forgejo_local_api_url }}/org/{{ forgejo_organization_name }}/repos
+        method: POST
+        url_username: "{{ forgejo_api_username }}"
+        url_password: "{{ forgejo_api_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          name: "{{ forgejo_repository_name }}"
+          private: true
+        status_code: 201
+      when: forgejo_repository.status == 404
+      no_log: true
+
+- name: Register the runner in Forgejo with forgejo-cli
+  hosts: forgejo_server
+  gather_facts: false
+  become: true
+
+  vars:
+    forgejo_runner_secret_path: /etc/forgejo/runner-registration.secret
+
+  tasks:
+    - name: Check whether the persisted runner secret exists
+      ansible.builtin.stat:
+        path: "{{ forgejo_runner_secret_path }}"
+      register: forgejo_runner_secret_file
+
+    - name: Generate the runner secret with Forgejo CLI when absent
+      ansible.builtin.command:
+        argv:
+          - podman
+          - exec
+          - --user
+          - git
+          - forgejo
+          - forgejo
+          - forgejo-cli
+          - actions
+          - generate-secret
+      register: forgejo_generated_runner_secret
+      changed_when: false
+      no_log: true
+      when: not forgejo_runner_secret_file.stat.exists
+
+    - name: Persist the Forgejo runner secret
+      ansible.builtin.copy:
+        dest: "{{ forgejo_runner_secret_path }}"
+        content: "{{ forgejo_generated_runner_secret.stdout }}\n"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      when: not forgejo_runner_secret_file.stat.exists
+
+    - name: Read the persisted Forgejo runner secret
+      ansible.builtin.slurp:
+        src: "{{ forgejo_runner_secret_path }}"
+      register: forgejo_runner_secret_data
+      no_log: true
+
+    - name: Validate the persisted runner secret format
+      ansible.builtin.assert:
+        that:
+          - forgejo_runner_secret_data.content | b64decode | trim is match('^[0-9a-fA-F]{40}$')
+        fail_msg: The persisted Forgejo runner secret is not a valid 40-character hexadecimal value.
+      no_log: true
+
+    - name: Register or update the organization-scoped runner using Forgejo CLI
+      ansible.builtin.command:
+        argv:
+          - podman
+          - exec
+          - --interactive
+          - --user
+          - git
+          - forgejo
+          - forgejo
+          - forgejo-cli
+          - actions
+          - register
+          - --name
+          - "{{ forgejo_runner_name }}"
+          - --scope
+          - "{{ forgejo_runner_scope }}"
+          - --labels
+          - "{{ forgejo_runner_labels }}"
+          - --secret-stdin=stdin
+        stdin: "{{ forgejo_runner_secret_data.content | b64decode | trim }}"
+        stdin_add_newline: false
+      register: forgejo_runner_registration
+      changed_when: false
+      no_log: true
+
+    - name: Return runner credentials to the in-memory inventory
+      ansible.builtin.add_host:
+        name: forgejo_automation_vm
+        groups: forgejo_automation
+        forgejo_runner_scope: "{{ hostvars['forgejo_server_vm']['forgejo_runner_scope'] }}"
+        forgejo_runner_uuid: "{{ forgejo_runner_registration.stdout | trim }}"
+        forgejo_runner_token: "{{ forgejo_runner_secret_data.content | b64decode | trim }}"
+      no_log: true
+
+- name: Configure the Forgejo Runner on the automation VM
+  hosts: forgejo_automation
+  gather_facts: false
+  become: true
+
+  vars:
+    automation_runner_config_path: /home/debian/.config/forgejo-runner/config.yaml
+
+  tasks:
+    - name: Wait for the automation VM to accept SSH connections
+      ansible.builtin.wait_for_connection:
+        delay: 5
+        timeout: 600
+
+    - name: Gather automation VM facts
+      ansible.builtin.setup:
+
+    - name: Require the runner configuration to have been provisioned
+      ansible.builtin.stat:
+        path: "{{ automation_runner_config_path }}"
+      register: automation_runner_config_file
+
+    - name: Fail if 03-automation-vm.yml has not provisioned the runner
+      ansible.builtin.assert:
+        that:
+          - automation_runner_config_file.stat.exists
+        fail_msg: Run playbooks/03-automation-vm.yml before this playbook.
+
+    - name: Configure the Forgejo Runner connection
+      ansible.builtin.copy:
+        dest: "{{ automation_runner_config_path }}"
+        owner: debian
+        group: debian
+        mode: "0600"
+        content: |
+          log:
+            level: info
+          runner:
+            file: /data/.runner
+            capacity: 1
+            labels:
+              - {{ forgejo_runner_labels }}
+          cache:
+            enabled: false
+          container:
+            network: ""
+            privileged: false
+            options: "--volume /home/debian/.ssh/ansible_ed25519:/run/secrets/ansible_ed25519:ro"
+            valid_volumes: []
+            docker_host: unix:///run/podman/podman.sock
+            force_pull: false
+            force_rebuild: false
+          server:
+            connections:
+              forgejo:
+                url: "{{ forgejo_server_url }}"
+                uuid: "{{ forgejo_runner_uuid }}"
+                token: "{{ forgejo_runner_token }}"
+      register: automation_runner_config
+      no_log: true
+
+    - name: Get the automation user's numeric ID
+      ansible.builtin.command:
+        argv:
+          - id
+          - -u
+          - debian
+      register: automation_user_uid
+      changed_when: false
+
+    - name: Wait for the automation user's systemd runtime directory
+      ansible.builtin.wait_for:
+        path: "/run/user/{{ automation_user_uid.stdout }}"
+        state: present
+        timeout: 60
+
+    - name: Wait for the automation user's systemd bus
+      ansible.builtin.wait_for:
+        path: "/run/user/{{ automation_user_uid.stdout }}/bus"
+        state: present
+        timeout: 60
+
+    - name: Reload and start the registered Forgejo Runner
+      ansible.builtin.systemd_service:
+        name: forgejo-runner.service
+        scope: user
+        enabled: true
+        state: "{{ 'restarted' if automation_runner_config.changed else 'started' }}"
+        daemon_reload: true
+      become_user: debian
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ automation_user_uid.stdout }}"
+        DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ automation_user_uid.stdout }}/bus"
+      no_log: true
+
+    - name: Report the completed Forgejo Actions setup
+      ansible.builtin.debug:
+        msg:
+          - "Forgejo is accessible at {{ forgejo_server_url }}"
+          - "Registered runner {{ forgejo_runner_name }} for {{ forgejo_runner_scope }}."
+          - "Forgejo Actions jobs can use runs-on: ansible."
+          - "Forgejo administrator username: {{ forgejo_admin_username }}"
+          - "Forgejo administrator password: {{ forgejo_admin_password }}"

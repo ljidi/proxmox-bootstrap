@@ -1,0 +1,19 @@
+name: Ansible syntax
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  syntax:
+    runs-on: ansible
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax-check repository playbooks
+        run: |
+          cd ansible
+          ansible-playbook --syntax-check playbooks/01-site.yml
+          ansible-playbook --syntax-check playbooks/02-devops-vm.yml
+          ansible-playbook --syntax-check playbooks/03-automation-vm.yml
+          ansible-playbook --syntax-check playbooks/04-forgejo-runner-config.yml
+          ansible-playbook --syntax-check playbooks/setup-all.yml

@@ -1,0 +1,5 @@
+---
+- ansible.builtin.import_playbook: 01-site.yml
+- ansible.builtin.import_playbook: 02-devops-vm.yml
+- ansible.builtin.import_playbook: 03-automation-vm.yml
+- ansible.builtin.import_playbook: 04-forgejo-runner-config.yml

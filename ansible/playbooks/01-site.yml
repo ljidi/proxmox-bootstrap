@@ -1,5 +1,5 @@
 ---
-- name: Configure this Proxmox VE host locally
+- name: "01 - Configure this Proxmox VE host locally"
   hosts: local
   gather_facts: true
   become: true
@@ -10,6 +10,7 @@
     debian_template_storage: local-lvm
     debian_cloud_image_url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
     debian_cloud_image_path: /var/lib/vz/template/iso/debian-13-genericcloud-amd64.qcow2
+    debian_vm_ssh_key_path: /root/.ssh/proxmox-vm
 
   tasks:
     - name: Install base administration and Proxmox packages
@@ -23,6 +24,45 @@
           - sudo
         state: present
         update_cache: true
+
+    - name: Create the VM SSH key directory
+      ansible.builtin.file:
+        path: "{{ debian_vm_ssh_key_path | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Generate the VM SSH keypair when absent
+      ansible.builtin.command:
+        argv:
+          - ssh-keygen
+          - -q
+          - -t
+          - ed25519
+          - -N
+          - ""
+          - -C
+          - proxmox-bootstrap-vm-access
+          - -f
+          - "{{ debian_vm_ssh_key_path }}"
+        creates: "{{ debian_vm_ssh_key_path }}"
+
+    - name: Set secure permissions on the VM SSH private key
+      ansible.builtin.file:
+        path: "{{ debian_vm_ssh_key_path }}"
+        state: file
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Set permissions on the VM SSH public key
+      ansible.builtin.file:
+        path: "{{ debian_vm_ssh_key_path }}.pub"
+        state: file
+        owner: root
+        group: root
+        mode: "0644"
 
     - name: Check whether the Debian template already exists
       ansible.builtin.command:
