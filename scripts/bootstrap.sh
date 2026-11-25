@@ -33,9 +33,38 @@ if [[ "${ID:-}" != "debian" ]] && [[ "${ID_LIKE:-}" != *debian* ]]; then
     fail "This script is intended for Debian-based Proxmox VE hosts."
 fi
 
+configure_no_subscription_repositories() {
+    local source_file
+
+    log "Checking Proxmox repository configuration"
+    for source_file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+        [[ -f "$source_file" ]] || continue
+
+        if grep -Eq '^[[:space:]]*(deb(-src)?[[:space:]].*|URIs:[[:space:]].*)https?://enterprise\.proxmox\.com/debian/' "$source_file"; then
+            log "Switching enterprise repository to no-subscription in $source_file"
+            sed -i -E \
+                -e 's#https?://enterprise\.proxmox\.com/debian/#http://download.proxmox.com/debian/#g' \
+                -e 's/(^|[[:space:]])pve-enterprise([[:space:]]|$)/\1pve-no-subscription\2/g' \
+                -e 's/(^|[[:space:]])enterprise([[:space:]]|$)/\1no-subscription\2/g' \
+                "$source_file"
+        fi
+    done
+}
+
 log "Updating package lists"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update
+readonly APT_UPDATE_LOG="$(mktemp)"
+if apt-get update 2>&1 | tee "$APT_UPDATE_LOG"; then
+    rm -f "$APT_UPDATE_LOG"
+elif grep -Eq '401[[:space:]]+Unauthorized' "$APT_UPDATE_LOG" && grep -q "enterprise.proxmox.com/debian/" "$APT_UPDATE_LOG"; then
+    rm -f "$APT_UPDATE_LOG"
+    configure_no_subscription_repositories
+    log "Retrying package list update with no-subscription repositories"
+    apt-get update
+else
+    rm -f "$APT_UPDATE_LOG"
+    fail "APT package-list update failed."
+fi
 
 log "Installing Git, certificates, sudo, Python, and SSH tools"
 apt-get install -y --no-install-recommends ca-certificates git openssh-client python3 sudo

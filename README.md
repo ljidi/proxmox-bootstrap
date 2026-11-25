@@ -19,6 +19,7 @@ wget -qO- https://raw.githubusercontent.com/ljidi/proxmox-bootstrap/main/scripts
 The script is idempotent:
 
 - Installs Git and base tools, then installs Ansible after updating APT.
+- Falls back to Proxmox no-subscription feeds if an enterprise repository returns an HTTP 401 during the APT update.
 - Clones the repository to `/root/proxmox-bootstrap` when it is absent.
 - Fetches and fast-forwards `/root/proxmox-bootstrap` when it already exists.
 - Uses the repository-managed `ansible/inventory.ini` and `ansible/ansible.cfg` files.
