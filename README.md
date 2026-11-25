@@ -32,11 +32,11 @@ cd /root/proxmox-bootstrap/ansible
 ansible-playbook playbooks/setup-all.yml
 ```
 
-The master playbook runs the four stages in order. It requires a working Proxmox VE host, `local-lvm` storage, the `vmbr0` bridge, DHCP on the guest network, a working QEMU guest agent, and network access to download the Debian and container images. All four stages run without prompts. Existing VM IDs `100` or `101` are not overwritten; choose different IDs in the playbook variables or remove the existing VMs before the first full run.
+The master playbook runs the four stages in order. It requires a working Proxmox VE host, `local-lvm` storage, the `vmbr0` bridge, DHCP on the guest network, and network access from the guests to Debian package repositories and container registries. The first stage enables snippets on the `local` directory storage and configures cloud-init to install the QEMU guest agent on new VMs. All four stages run without prompts. Existing VM IDs `100` or `101` are not overwritten; choose different IDs in the playbook variables or remove the existing VMs before the first full run.
 
 The ordered playbooks are:
 
-- `01-site.yml` creates the Debian 13 cloud-init template and the root-only Proxmox-to-VM Ed25519 keypair.
+- `01-site.yml` creates the Debian 13 cloud-init template, prepares local cloud-init vendor data to install the QEMU guest agent, and creates the root-only Proxmox-to-VM Ed25519 keypair.
 - `02-devops-vm.yml` creates the Debian VM and starts Forgejo with PostgreSQL in a Podman pod.
 - `03-automation-vm.yml` creates the automation VM, installs Ansible and rootless Podman, and prepares Forgejo Runner.
 - `04-forgejo-runner-config.yml` creates the Forgejo administrator, organization and repository, then registers and starts the runner.

@@ -124,6 +124,8 @@
           - ip=dhcp
           - --agent
           - enabled=1
+          - --cicustom
+          - "vendor={{ debian_guest_agent_vendor_data_volume }}"
 
     - name: Start the Debian VM
       ansible.builtin.command:

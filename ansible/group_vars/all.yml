@@ -1,0 +1,2 @@
+debian_guest_agent_vendor_data_path: /var/lib/vz/snippets/proxmox-bootstrap-guest-agent.yaml
+debian_guest_agent_vendor_data_volume: local:snippets/proxmox-bootstrap-guest-agent.yaml
