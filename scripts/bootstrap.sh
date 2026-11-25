@@ -92,10 +92,10 @@ if [[ -d "$REPO_DIR/.git" ]]; then
 else
     [[ -e "$REPO_DIR" ]] && fail "$REPO_DIR exists but is not a Git repository."
 
-    readonly PARENT_DIR
     PARENT_DIR="$(dirname "$REPO_DIR")"
-    readonly TEMP_DIR
+    readonly PARENT_DIR
     TEMP_DIR="$(mktemp -d "$PARENT_DIR/.proxmox-bootstrap.XXXXXX")"
+    readonly TEMP_DIR
     trap 'rm -rf "${TEMP_DIR:-}"' EXIT
 
     git clone --branch "$REPO_BRANCH" --single-branch "$REPO_URL" "$TEMP_DIR/repository"
