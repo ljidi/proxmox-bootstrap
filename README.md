@@ -37,7 +37,7 @@ The master playbook runs the four stages in order. It requires a working Proxmox
 The ordered playbooks are:
 
 - `01-site.yml` creates the Debian 13 cloud-init template, prepares local cloud-init vendor data to install the QEMU guest agent, and creates the root-only Proxmox-to-VM Ed25519 keypair.
-- `02-devops-vm.yml` creates the Debian VM and starts Forgejo with PostgreSQL in a Podman pod.
+- `02-devops-vm.yml` creates the Debian VM and starts Forgejo 17 with PostgreSQL in a Podman pod.
 - `03-automation-vm.yml` creates the automation VM, installs Ansible and rootless Podman, and prepares Forgejo Runner.
 - `04-forgejo-runner-config.yml` creates the Forgejo administrator, organization and repository, then registers and starts the runner.
 

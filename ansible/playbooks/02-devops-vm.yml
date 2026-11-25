@@ -184,7 +184,7 @@
   become: true
 
   vars:
-    forgejo_image: codeberg.org/forgejo/forgejo:latest
+    forgejo_image: data.forgejo.org/forgejo/forgejo:17
     forgejo_postgres_image: docker.io/library/postgres:17
 
   tasks:
