@@ -58,7 +58,7 @@
     - name: Require the source VM to be a template
       ansible.builtin.assert:
         that:
-          - debian_template_config.stdout is regex('(?m)^template: 1$')
+          - "'template: 1' in debian_template_config.stdout_lines"
         fail_msg: >-
           VM {{ debian_template_vmid }} is not a Proxmox template. Run
           playbooks/01-site.yml first to create the Debian template.
