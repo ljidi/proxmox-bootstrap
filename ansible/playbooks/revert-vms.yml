@@ -1,0 +1,67 @@
+---
+- name: Stop and remove the DevOps and automation VMs
+  hosts: local
+  gather_facts: false
+  become: true
+
+  vars:
+    revert_vm_ids:
+      - 100
+      - 101
+
+  tasks:
+    - name: Check whether each VM configuration exists
+      ansible.builtin.stat:
+        path: "/etc/pve/qemu-server/{{ item }}.conf"
+      loop: "{{ revert_vm_ids }}"
+      register: revert_vm_configs
+
+    - name: Set the IDs of VMs that exist
+      ansible.builtin.set_fact:
+        existing_revert_vm_ids: >-
+          {{
+            revert_vm_configs.results
+            | selectattr('stat.exists')
+            | map(attribute='item')
+            | list
+          }}
+
+    - name: Check the status of each existing VM
+      ansible.builtin.command:
+        argv:
+          - qm
+          - status
+          - "{{ item }}"
+      loop: "{{ existing_revert_vm_ids }}"
+      loop_control:
+        label: "{{ item }}"
+      register: revert_vm_status
+      changed_when: false
+
+    - name: Stop active VMs gracefully
+      ansible.builtin.command:
+        argv:
+          - qm
+          - shutdown
+          - "{{ item.item }}"
+          - --timeout
+          - "60"
+          - --forceStop
+          - "1"
+      loop: "{{ revert_vm_status.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: "'status: stopped' not in item.stdout"
+
+    - name: Remove existing VMs and their disks
+      ansible.builtin.command:
+        argv:
+          - qm
+          - destroy
+          - "{{ item }}"
+          - --purge
+          - --destroy-unreferenced-disks
+          - "1"
+      loop: "{{ existing_revert_vm_ids }}"
+      loop_control:
+        label: "{{ item }}"

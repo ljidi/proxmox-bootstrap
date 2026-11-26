@@ -41,6 +41,15 @@ The ordered playbooks are:
 - `03-automation-vm.yml` creates the automation VM, installs Ansible and rootless Podman, and prepares Forgejo Runner.
 - `04-forgejo-runner-config.yml` creates the Forgejo administrator, organization and repository, then registers and starts the runner.
 
+To stop and permanently remove VMs `100` and `101` and their disks, run the separate, destructive revert playbook:
+
+```sh
+cd /root/proxmox-bootstrap/ansible
+ansible-playbook playbooks/revert-vms.yml
+```
+
+It skips VM IDs that do not exist and does not remove the Debian template.
+
 ```sh
 cd /root/proxmox-bootstrap/ansible
 ansible-playbook playbooks/01-site.yml
