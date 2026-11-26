@@ -274,7 +274,7 @@
           [Pod]
           PodName=forgejo
           PublishPort=3000:3000
-          PublishPort=2222:22
+          PublishPort=2222:2222
 
           [Install]
           WantedBy=multi-user.target
@@ -325,6 +325,7 @@
           Environment=FORGEJO__server__ROOT_URL=http://{{ forgejo_vm_ipv4 }}:3000/
           Environment=FORGEJO__server__SSH_DOMAIN={{ forgejo_vm_ipv4 }}
           Environment=FORGEJO__server__SSH_PORT=2222
+          Environment=FORGEJO__server__SSH_LISTEN_PORT=2222
           Environment=FORGEJO__server__START_SSH_SERVER=true
           Environment=FORGEJO__security__INSTALL_LOCK=true
           Volume=forgejo-data:/data
@@ -357,6 +358,14 @@
       retries: 30
       delay: 2
       until: forgejo_postgres_ready.rc == 0
+
+    - name: Clear any previous Forgejo service failure state
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - reset-failed
+          - forgejo.service
+      changed_when: false
 
     - name: Start the Forgejo container
       ansible.builtin.systemd_service:
